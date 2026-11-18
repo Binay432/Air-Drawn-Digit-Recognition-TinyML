@@ -111,7 +111,7 @@ The board runs all 750 test images once, then prints the accuracy and inference 
 | Total inference time: | 74656 ms
  
 <p align="center">
-  <img src="OutputImg/ESP32.png" width="400">
+  <img src="OutputImg/ESP32.png" width="400"><br>
   <em>ESP-WROOM-32 showing the final int8 accuracy (722/750)</em>
 </p>
  
