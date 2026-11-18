@@ -67,7 +67,7 @@ bool initCamera()
 }
 
 // ---------- TFLite Micro ----------
-constexpr int kArenaSize = 16 * 1024;
+constexpr int kArenaSize = 64 * 1024; // bigger: float16 weights are unpacked here
 alignas(16) static uint8_t tensor_arena[kArenaSize];
 
 tflite::MicroErrorReporter error_reporter;
@@ -75,6 +75,75 @@ tflite::AllOpsResolver resolver;
 tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
 TfLiteTensor *output = nullptr;
+
+const char *typeName(TfLiteType t)
+{
+    switch (t)
+    {
+    case kTfLiteFloat32:
+        return "float32";
+    case kTfLiteInt8:
+        return "int8";
+    case kTfLiteInt16:
+        return "int16";
+    case kTfLiteUInt8:
+        return "uint8";
+    case kTfLiteFloat16:
+        return "float16";
+    default:
+        return "other";
+    }
+}
+
+bool supported(TfLiteType t)
+{
+    return t == kTfLiteFloat32 || t == kTfLiteInt8 || t == kTfLiteInt16;
+}
+
+// Write one pixel (0..1 float) into the model input, whatever its type
+void setInput(int i, float v)
+{
+    const float s = input->params.scale;
+    const int zp = input->params.zero_point;
+    switch (input->type)
+    {
+    case kTfLiteFloat32:
+        input->data.f[i] = v;
+        break;
+    case kTfLiteInt8:
+    {
+        int q = (int)lroundf(v / s) + zp;
+        input->data.int8[i] = (int8_t)constrain(q, -128, 127);
+        break;
+    }
+    case kTfLiteInt16:
+    {
+        int q = (int)lroundf(v / s) + zp;
+        input->data.i16[i] = (int16_t)constrain(q, -32768, 32767);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Read one output score back as a float, whatever its type
+float getOutput(int i)
+{
+    const float s = output->params.scale;
+    const int zp = output->params.zero_point;
+    switch (output->type)
+    {
+    case kTfLiteFloat32:
+        return output->data.f[i];
+    case kTfLiteInt8:
+        return (output->data.int8[i] - zp) * s;
+    case kTfLiteInt16:
+        return (output->data.i16[i] - zp) * s;
+    default:
+        return 0.0f;
+    }
+}
 
 // ---------- Image buffers ----------
 constexpr int FW = 160, FH = 120; // camera frame
@@ -212,7 +281,7 @@ void doPredict()
 
     uint32_t t0 = millis();
     for (int i = 0; i < IMG * IMG; i++)
-        input->data.f[i] = img[i];
+        setInput(i, img[i]);
     if (interpreter->Invoke() != kTfLiteOk)
     {
         predText = "Invoke failed";
@@ -224,7 +293,7 @@ void doPredict()
     float p[10], sum = 0;
     for (int i = 0; i < 10; i++)
     {
-        p[i] = output->data.f[i];
+        p[i] = getOutput(i);
         sum += p[i];
     }
     if (fabs(sum - 1.0f) > 0.01f)
@@ -289,7 +358,6 @@ void handleRoot()
 <h3>Model input (20x20)</h3>
 <img id="inp" width="200" style="image-rendering:pixelated">
 <script>
-// live feed: ask for the next frame only after the last one arrived
 function nextFrame() { cam.src = '/cam.jpg?' + Date.now(); }
 cam.onload  = () => setTimeout(nextFrame, 100);
 cam.onerror = () => setTimeout(nextFrame, 500);
@@ -306,22 +374,20 @@ function predict() {
 }
 btn.onclick = predict;
 document.onkeydown = e => { if (e.key === 'c' || e.key === 'C') predict(); };
-
-// also pick up predictions triggered from the Serial Monitor
 setInterval(() => fetch('/pred').then(r => r.text()).then(show), 1000);
 </script>
 </body></html>)");
 }
 
 void handleCam()
-{ // live processed view
+{
     if (grabFrame())
         makeInk();
     sendGrayJpeg(ink, FW, FH);
 }
 
 void handleInput()
-{ // 20x20 model input, enlarged
+{
     for (int y = 0; y < BIG; y++)
         for (int x = 0; x < BIG; x++)
             inputBig[y * BIG + x] = (uint8_t)(img[(y / SCALE) * IMG + (x / SCALE)] * 255);
@@ -329,13 +395,13 @@ void handleInput()
 }
 
 void handlePredict()
-{ // "c" from the browser
+{
     doPredict();
     server.send(200, "text/plain", predText);
 }
 
 void handlePred()
-{ // latest result
+{
     server.send(200, "text/plain", predText);
 }
 
@@ -386,6 +452,7 @@ void setup()
     pinMode(FLASH_LED, OUTPUT);
     digitalWrite(FLASH_LED, HIGH); // LED on after the camera has started
 
+    Serial.printf("Model size: %u bytes\n", g_model_len);
     const tflite::Model *model = tflite::GetModel(g_model);
     if (model->version() != TFLITE_SCHEMA_VERSION)
         fail("Schema mismatch");
@@ -398,6 +465,17 @@ void setup()
     output = interpreter->output(0);
     if (!input || !output)
         fail("input/output is null");
+
+    Serial.printf("Input type:  %s (scale %f, zero point %d)\n",
+                  typeName(input->type), input->params.scale, input->params.zero_point);
+    Serial.printf("Output type: %s (scale %f, zero point %d)\n",
+                  typeName(output->type), output->params.scale, output->params.zero_point);
+    Serial.printf("Arena used: %u of %d bytes\n",
+                  interpreter->arena_used_bytes(), kArenaSize);
+    if (!supported(input->type))
+        fail("Input type not supported");
+    if (!supported(output->type))
+        fail("Output type not supported");
     Serial.println("Model OK");
 
     startWifi();
@@ -407,10 +485,10 @@ void setup()
 // ---------- Loop ----------
 void loop()
 {
-    server.handleClient(); // live view + browser commands
+    server.handleClient();
 
     if (Serial.available())
-    { // "c" from the Serial Monitor
+    {
         char ch = Serial.read();
         if (ch == 'c' || ch == 'C')
             doPredict();
