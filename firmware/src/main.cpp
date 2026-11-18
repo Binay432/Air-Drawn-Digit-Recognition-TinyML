@@ -9,17 +9,18 @@
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
-// ---------------- Model selection ----------------
 #include "model_data_8.h"
+#include "test_data.h"
+
 #define MODEL_ARRAY g_model_8
 #define MODEL_LEN g_model_8_len
 #define MODEL_NAME "INT8"
 
-// ---------------- Config ----------------
+// ---------------- Oled Config ----------------
 #define SCREEN_W 128
 #define SCREEN_H 64
 #define OLED_ADDR 0x3C
-#define ARENA_KB 60 // tune after seeing "Arena used" on Serial
+#define ARENA_KB 60 // tunable
 
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
 
@@ -50,14 +51,14 @@ void oled(const String &l1, const String &l2 = "", const String &l3 = "")
 }
 
 // ---------------- TFLite Micro ----------------
-constexpr int kArenaSize = ARENA_KB * 1024;
+constexpr int kArenaSize = ARENA_KB * 1024; // working memory for the model
 alignas(16) static uint8_t tensor_arena[kArenaSize];
 
-tflite::MicroErrorReporter error_reporter;
-tflite::AllOpsResolver resolver;
-tflite::MicroInterpreter *interpreter = nullptr;
-TfLiteTensor *input = nullptr;
-TfLiteTensor *output = nullptr;
+tflite::MicroErrorReporter error_reporter;       // tflite print own error message to serial
+tflite::AllOpsResolver resolver;                 // resolver holds the actual code for cnn operation (conv2d, maxpool, dense and softmax)
+tflite::MicroInterpreter *interpreter = nullptr; // engine that runs the model
+TfLiteTensor *input = nullptr;                   // pointer to models input data
+TfLiteTensor *output = nullptr;                  // pointer to models output data
 
 void fail(const char *msg)
 {
@@ -67,6 +68,7 @@ void fail(const char *msg)
         delay(1000);
 }
 
+// To see the  input, outpur shape
 void printTensorInfo(const char *name, TfLiteTensor *t)
 {
     Serial.printf("%s: type=%s dims=[", name, TfLiteTypeGetName(t->type));
@@ -119,11 +121,75 @@ void setup()
     // if (input->type != kTfLiteInt8)
     //     Serial.println("WARNING: input is not int8 - check the conversion");
 
+    // Check data has loaded
+    // Test data check
+    Serial.printf("Test samples: %d x %d\n", kNumSamples, kInputSize);
+    Serial.printf("Test data size: %u bytes\n", (unsigned)sizeof(test_samples));
+    Serial.printf("Labels size: %u bytes\n", (unsigned)sizeof(test_labels));
+
     oled("Model ready", MODEL_NAME,
          "Arena " + String(interpreter->arena_used_bytes() / 1024) + "/" + String(ARENA_KB) + "KB");
 }
 
 void loop()
 {
-    delay(1000); // inference on test samples comes in step 3
+    static bool done = false; // for single run
+    if (done)
+    {
+        delay(1000);
+        return;
+    }
+
+    int correct = 0;
+    unsigned long totalTime = 0;
+
+    Serial.printf("\nTesting %d samples...\n", kNumSamples);
+    Serial.println("Wrong predictions:");
+
+    for (int i = 0; i < kNumSamples; i++)
+    {
+        // 1. Copy one sample into the model input
+        for (int k = 0; k < kInputSize; k++)
+            input->data.f[k] = test_samples[i][k];
+
+        // 2. Inference run and prediction time
+        unsigned long t0 = micros();
+        if (interpreter->Invoke() != kTfLiteOk)
+            fail("Invoke failed");
+        totalTime += micros() - t0;
+
+        // 3. Argmax: class with the highest score
+        int pred = 0;
+        float best = output->data.f[0];
+        for (int c = 1; c < 10; c++)
+        {
+            if (output->data.f[c] > best)
+            {
+                best = output->data.f[c];
+                pred = c;
+            }
+        }
+
+        // 4. Count correct, print only the wrong ones
+        if (pred == test_labels[i])
+            correct++;
+
+        // 5. Progress on OLED every 20 samples
+        if (i % 20 == 0)
+            oled("Testing 8-bit...", String(i) + " / " + String(kNumSamples));
+    }
+
+    // 6. Final result
+    float acc = (correct / kNumSamples) * 100.0f;
+    unsigned long avgTime = totalTime / kNumSamples;
+
+    Serial.printf("\nAccuracy: %d/%d = %.2f%%\n", correct, kNumSamples, acc);
+    Serial.printf("Avg inference time: %lu us\n", avgTime);
+    Serial.printf("Total inference time: %lu ms\n", totalTime / 1000);
+
+    oled("8-bit model",
+         "Acc: " + String(correct) + "/" + String(kNumSamples),
+         String(acc, 2) + "%  " + String(avgTime) + " us");
+
+    done = true;
 }
